@@ -3,53 +3,57 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Brille Bridge — Diagnose</title>
+<title>Micro:bit ↔ Brille Bridge</title>
 <style>
-  body{font-family:system-ui,Arial,sans-serif;background:#111;color:#eee;padding:16px}
+  body{font-family:system-ui,Arial,sans-serif;background:#121212;color:#eee;padding:16px}
+  h1{font-size:18px}
   button{display:block;width:100%;padding:12px;margin:8px 0;border-radius:8px;border:none;font-size:16px;cursor:pointer}
-  .btnA{background:#d33682;color:#fff}
-  .btnB{background:#268bd2;color:#fff}
-  .log{background:#000;border:1px solid #333;padding:10px;height:320px;overflow:auto;font-family:monospace;font-size:12px;margin-top:10px}
-  .small{font-size:12px;color:#bbb}
+  .btnMicro{background:#d33682;color:#fff}
+  .btnGlass{background:#268bd2;color:#fff}
+  .log{background:#000;border:1px solid #333;padding:10px;height:320px;overflow:auto;font-family:monospace;font-size:12px;margin-top:10px;white-space:pre-wrap}
+  .small{font-size:13px;color:#bbb}
 </style>
 </head>
 <body>
-  <h2>Micro:bit ➜ Brille — Diagnose</h2>
-  <p class="small">Schalte Shining-App aus und starte die Brille neu, bevor du verbindest.</p>
+  <h1>Micro:bit ↔ Brille Bridge</h1>
+  <p class="small">1) Shining-App schließen. 2) Brille aus/an. 3) Micro:bit neu flashen (No Pairing & startUartService).</p>
 
-  <button class="btnA" onclick="connectMicrobit()">1) Micro:bit verbinden</button>
+  <button class="btnMicro" onclick="connectMicrobit()">1) Micro:bit verbinden</button>
   <div id="statusMicro">Status: nicht verbunden</div>
 
-  <button class="btnB" onclick="connectGlasses()">2) Brille verbinden (Diagnose)</button>
+  <button class="btnGlass" onclick="connectGlasses()">2) Brille verbinden</button>
   <div id="statusGlass">Status: nicht verbunden</div>
 
-  <button onclick="testWrite(0x01)">Test: Sende 0x01 an Brille</button>
-  <button onclick="testWrite(0x02)">Test: Sende 0x02 an Brille</button>
-  <button onclick="showLast()" >Zeige letzten Log</button>
+  <button onclick="sendManual(0x01)">Manuell: Sende 0x01</button>
+  <button onclick="sendManual(0x02)">Manuell: Sende 0x02</button>
 
   <div class="log" id="log">Log startet...</div>
 
 <script>
+/* Konfiguration */
 const MBIT_UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const MBIT_UART_RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const MBIT_UART_RX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Notify expected
 
-const GLASS_SERVICE_GUESS = '0000fff0-0000-1000-8000-00805f9b34fb';
-const GLASS_CHAR_GUESS1 = '0000fff1-0000-1000-8000-00805f9b34fb';
-const GLASS_CHAR_GUESS3 = '0000fff3-0000-1000-8000-00805f9b34fb';
+const GLASS_SERVICE_FFF0 = '0000fff0-0000-1000-8000-00805f9b34fb';
+const KNOWN_GLASS_CHARS = [
+  'd44bc439-abfd-45a2-b575-925416129600',
+  'd44bc439-abfd-45a2-b575-925416129601',
+  'd44bc439-abfd-45a2-b575-92541612960a',
+  'd44bc439-abfd-45a2-b575-92541612960b'
+];
 
 let glassChar = null;
-let lastLog = '';
+let microDevice = null;
+let microServer = null;
 
-function log(s){
+function log(msg){
   const el = document.getElementById('log');
-  const time = new Date().toLocaleTimeString();
-  el.innerHTML = `[${time}] ${s}\n` + el.innerHTML;
-  lastLog = `[${time}] ${s}\n` + lastLog;
-  console.log(s);
+  const t = new Date().toLocaleTimeString();
+  el.textContent = `[${t}] ${msg}\n` + el.textContent;
+  console.log(msg);
 }
 
-function showLast(){ alert(lastLog || 'kein Eintrag'); }
-
+/* --- Micro:bit Connect (robust) --- */
 async function connectMicrobit(){
   try{
     log('Starte Micro:bit Suche (acceptAllDevices, optional UART service)...');
@@ -57,43 +61,88 @@ async function connectMicrobit(){
       acceptAllDevices: true,
       optionalServices: [MBIT_UART_SERVICE]
     });
-    log('Micro:bit gewählt: ' + (device.name || '(kein Name)') + ' — id: ' + device.id);
-    document.getElementById('statusMicro').innerText = 'Verbunden: ' + (device.name || device.id);
+    microDevice = device;
+    document.getElementById('statusMicro').innerText = 'Ausgewählt: ' + (device.name || device.id);
+    log('Micro:bit gewählt: ' + (device.name || device.id));
 
-    const server = await device.gatt.connect();
-    log('GATT server connected, hole UART service...');
-    const service = await server.getPrimaryService(MBIT_UART_SERVICE);
-    const char = await service.getCharacteristic(MBIT_UART_RX);
-    await char.startNotifications();
-    char.addEventListener('characteristicvaluechanged', (e) => {
-      const v = new TextDecoder().decode(e.target.value);
-      log('Micro:bit -> ' + v.trim());
-      // wenn Brille verbunden: weiterleiten
-      if (glassChar){
-        if (v.includes('A')) sendToGlass(0x01);
-        if (v.includes('B')) sendToGlass(0x02);
-      } else {
-        log('Brille noch nicht verbunden — empfangene Commands werden nicht weitergeleitet');
-      }
-    });
     device.addEventListener('gattserverdisconnected', () => {
-      log('Micro:bit getrennt');
+      log('Micro:bit: GATT disconnected');
       document.getElementById('statusMicro').innerText = 'nicht verbunden';
     });
-    log('Micro:bit Notifications aktiv.');
-  }catch(err){
-    log('Fehler Micro:bit: ' + (err && (err.name + ' / ' + err.message)) );
+
+    const server = await device.gatt.connect();
+    microServer = server;
+    log('GATT server connected, versuche UART Service...');
+
+    // Versuche Standard UART Service
+    try {
+      const svc = await server.getPrimaryService(MBIT_UART_SERVICE);
+      log('UART Service gefunden.');
+      // versuche RX notify char
+      try {
+        const ch = await svc.getCharacteristic(MBIT_UART_RX);
+        await ch.startNotifications();
+        ch.addEventListener('characteristicvaluechanged', onMicrobitNotify);
+        document.getElementById('statusMicro').innerText = '✅ Verbunden (UART)';
+        log('Micro:bit Notifications aktiv (UART).');
+        return;
+      } catch(e) {
+        log('UART RX characteristic nicht erreichbar: ' + (e && (e.name + ' / ' + e.message)));
+      }
+    } catch(e) {
+      log('UART Service nicht gefunden oder Fehler: ' + (e && (e.name + ' / ' + e.message)));
+    }
+
+    // Fallback: liste alle services und suche nach notify-fähiger Characteristic
+    log('FALLBACK: Suche nach einer notify-fähigen Characteristic in allen Services...');
+    const services = await server.getPrimaryServices();
+    for (const s of services){
+      const chars = await s.getCharacteristics();
+      for (const c of chars){
+        if (c.properties.notify || c.properties.indicate){
+          try {
+            await c.startNotifications();
+            c.addEventListener('characteristicvaluechanged', onMicrobitNotify);
+            document.getElementById('statusMicro').innerText = '✅ Verbunden (Fallback notify)';
+            log('Gefunden notify-char: ' + c.uuid + ' (service ' + s.uuid + ')');
+            return;
+          } catch(e){
+            log('Fehler beim startNotifications auf ' + c.uuid + ' : ' + (e && e.message));
+          }
+        }
+      }
+    }
+
+    log('Keine notify-fähige Characteristic gefunden. Micro:bit-Connect erfordert ggf. No Pairing oder anderes Firmware-Setup.');
+  } catch(err){
+    log('Fehler Micro:bit: ' + (err && (err.name + ' / ' + err.message)));  
+    document.getElementById('statusMicro').innerText = 'Fehler';
   }
 }
 
+function onMicrobitNotify(event){
+  const val = new TextDecoder().decode(event.target.value || event.value || new DataView(event.target.value));
+  log('Micro:bit -> ' + val.trim());
+  // einfache Erkennung A/B
+  if (!glassChar){
+    log('Brille nicht verbunden — Befehl wird nicht gesendet.');
+    return;
+  }
+  if (val.includes('A')) sendToGlass(0x01);
+  else if (val.includes('B')) sendToGlass(0x02);
+  else log('Micro:bit sendete unbekannten Payload: ' + val.trim());
+}
+
+/* --- Brille Connect (dynamisch) --- */
 async function connectGlasses(){
   try{
-    log('Starte Brillen-Suche (acceptAllDevices mit optionalem FFF0 Service).');
+    log('Starte Brillen-Suche (acceptAllDevices, optional FFF0 service)...');
     const device = await navigator.bluetooth.requestDevice({
       acceptAllDevices: true,
-      optionalServices: [GLASS_SERVICE_GUESS]
+      optionalServices: [GLASS_SERVICE_FFF0]
     });
-    log('Ausgewählt: ' + (device.name || '(kein Name)') + ' id:' + device.id);
+    log('Brille ausgewählt: ' + (device.name || device.id));
+    document.getElementById('statusGlass').innerText = 'Ausgewählt: ' + (device.name || device.id);
 
     device.addEventListener('gattserverdisconnected', () => {
       log('Brille: getrennt');
@@ -102,60 +151,53 @@ async function connectGlasses(){
     });
 
     const server = await device.gatt.connect();
-    log('GATT verbunden. Services abrufen (dies kann einige Sekunden dauern)...');
-
-    // List all primary services and characteristics for diagnosis:
+    log('GATT verbunden. Services abrufen...');
     const services = await server.getPrimaryServices();
     log('Anzahl Services: ' + services.length);
+
+    // enumerate and log
     for (const s of services){
+      log('Service: ' + s.uuid);
       try{
-        log('Service UUID: ' + s.uuid);
         const chars = await s.getCharacteristics();
         log(' -> Characteristics: ' + chars.length);
         for (const c of chars){
-          // Eigenschaften anzeigen
-          log('    * Char UUID: ' + c.uuid + ' props: ' + JSON.stringify(c.properties));
+          log('    * ' + c.uuid + ' props: ' + JSON.stringify(c.properties));
         }
-      }catch(e){
-        log('Fehler beim Lesen der Characteristics von ' + s.uuid + ' : ' + (e && e.message));
+      } catch(e){
+        log('    -> Fehler beim Lesen der Characteristics von ' + s.uuid + ' : ' + (e && e.message));
       }
     }
 
-    // Versuch: Hole FFF1 oder FFF3 in service FFF0
-    try {
-      const svc = await server.getPrimaryService(GLASS_SERVICE_GUESS);
-      log('FFF0 Service gefunden: ' + svc.uuid);
-      // probiere fff3 zuerst:
-      try {
-        const c3 = await svc.getCharacteristic(GLASS_CHAR_GUESS3);
-        log('Characteristic fff3 gefunden: ' + c3.uuid + ' props: ' + JSON.stringify(c3.properties));
-        glassChar = c3;
-      } catch(e) {
-        log('fff3 nicht gefunden oder Fehler: ' + (e && e.message));
-      }
-      if (!glassChar){
+    // Versuche bekannte proprietary UUIDs (die aus deinem Log kommen)
+    let svcFFF0 = null;
+    try { svcFFF0 = await server.getPrimaryService(GLASS_SERVICE_FFF0); }
+    catch(e){ log('Kein FFF0 Service oder nicht zugreifbar: ' + (e && e.message)); }
+
+    if (svcFFF0){
+      // prüfe bekannte chars in der Reihenfolge
+      for (const uuid of KNOWN_GLASS_CHARS){
         try {
-          const c1 = await svc.getCharacteristic(GLASS_CHAR_GUESS1);
-          log('Characteristic fff1 gefunden: ' + c1.uuid + ' props: ' + JSON.stringify(c1.properties));
-          glassChar = c1;
+          const c = await svcFFF0.getCharacteristic(uuid);
+          log('Gefundene bekannte Char: ' + uuid + ' props: ' + JSON.stringify(c.properties));
+          // wähle sie, auch wenn props leer sind (manche Geräte melden props nicht korrekt)
+          glassChar = c;
+          break;
         } catch(e){
-          log('fff1 nicht gefunden oder Fehler: ' + (e && e.message));
+          // ignore
         }
       }
-    } catch(e) {
-      log('Kein FFF0 Service unter diesem Gerät oder Fehler beim Zugriff: ' + (e && e.message));
     }
 
-    // Falls keine fff1/fff3 gefunden, suche Schreibbare Characteristic generell:
+    // fallback: nimm erste beschreibbare characteristic in allen services
     if (!glassChar){
-      log('Suche nach einer beschreibbaren Characteristic in allen Services...');
+      log('Keine bekannte Char gefunden — suche erste beschreibbare Characteristic...');
       for (const s of services){
         const chars = await s.getCharacteristics();
         for (const c of chars){
-          // prüfe, ob write oder writeWithoutResponse möglich ist
           if (c.properties.write || c.properties.writeWithoutResponse){
-            log(' -> Verwende beschreibbare Characteristic ' + c.uuid + ' (service ' + s.uuid + ')');
             glassChar = c;
+            log(' -> Verwende beschreibbare Characteristic: ' + c.uuid + ' (service ' + s.uuid + ')');
             break;
           }
         }
@@ -164,43 +206,39 @@ async function connectGlasses(){
     }
 
     if (glassChar){
+      document.getElementById('statusGlass').innerText = '✅ Verbunden (char: ' + glassChar.uuid + ')';
       log('Brillen-Write-Characteristic gesetzt: ' + glassChar.uuid + ' props: ' + JSON.stringify(glassChar.properties));
-      document.getElementById('statusGlass').innerText = 'Verbunden (char: ' + glassChar.uuid + ')';
-      // optional: sofort einen Test-Write senden
-      try {
-        await sendToGlass(0x01, true); // true = kein weiteres Logging-Error brechen
-        log('Test-Write 0x01 gesendet (oder versucht).');
-      }catch(e){
-        log('Fehler beim Test-Write: ' + (e && e.message));
-      }
-    }else{
-      log('Keine passende Write-Characteristic gefunden. Wenn möglich: nRF Connect öffnen und die Liste der Characteristics hier posten.');
-      document.getElementById('statusGlass').innerText = 'gefunden: keine write-char';
+      // optional test write (nicht blockierend)
+      try { await glassChar.writeValue(new Uint8Array([0x01])); log('Test-Write 0x01 gesendet (oder versucht).'); }
+      catch(e){ log('Fehler beim Test-Write: ' + (e && (e.name + ' / ' + e.message))); }
+    } else {
+      log('Keine passende Write-Characteristic gefunden.');
+      document.getElementById('statusGlass').innerText = 'Keine write-char gefunden';
     }
 
-  }catch(err){
-    log('Fehler Brille (request/connect): ' + (err && (err.name + ' / ' + err.message)));
+  } catch(err){
+    log('Fehler Brille (request/connect): ' + (err && (err.name + ' / ' + err.message)));  
     document.getElementById('statusGlass').innerText = 'Fehler';
   }
 }
 
-async function sendToGlass(byteVal, silent){
-  if (!glassChar) {
-    if (!silent) log('Keine Characteristic gesetzt!');
+/* --- Senden / Hilfsfunktionen --- */
+async function sendToGlass(byteVal){
+  if (!glassChar){
+    log('Keine Brillen-Characteristic gesetzt!');
     return;
   }
   try{
     const arr = new Uint8Array([byteVal]);
     await glassChar.writeValue(arr);
     log('Sende an Brille: 0x' + byteVal.toString(16));
-  }catch(e){
-    log('Write-Fehler: ' + (e && (e.name + ' / ' + e.message)));
+  } catch(e){
+    log('Write-Fehler: ' + (e && (e.name + ' / ' + e.message)));  
   }
 }
 
-async function testWrite(val){
-  await sendToGlass(val);
-}
+function sendManual(v){ sendToGlass(v); }
+
 </script>
 </body>
 </html>
