@@ -3,27 +3,24 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Brille — Test Sender</title>
+<title>Brille — Bruteforce Test</title>
 <style>
   body{font-family:system-ui,Arial,sans-serif;background:#111;color:#eee;padding:16px}
   button{display:block;width:100%;padding:10px;margin:8px 0;border-radius:8px;border:none;font-size:15px;cursor:pointer}
-  .log{background:#000;padding:10px;height:360px;overflow:auto;font-family:monospace;font-size:12px;white-space:pre-wrap}
+  .log{background:#000;padding:10px;height:480px;overflow:auto;font-family:monospace;font-size:12px;white-space:pre-wrap}
 </style>
 </head>
 <body>
-  <h2>Brille — Test Sender</h2>
-  <p>Shining-App schließen, Brille neu starten.</p>
-  <button onclick="connectGlasses()">Connect Brille (Diagnose)</button>
-  <div>
-    <button onclick="sendAllTests()">Send: mehrere Test-Payloads an alle found-chars</button>
-    <button onclick="sendOneByOne()">Send: sequenziell an bekannte proprietary chars</button>
-    <button onclick="clearLog()">Clear Log</button>
-  </div>
+  <h2>Brille — Bruteforce Test</h2>
+  <p>Schließe Shining-App, starte Brille neu. Die Seite probiert viele typische Payload‑Formate.</p>
+  <button id="btnConnect">Connect Brille (Diagnose)</button>
+  <button id="btnRun" disabled>Run bruteforce tests</button>
+  <button onclick="clearLog()">Clear Log</button>
   <div class="log" id="log">Log startet...</div>
 
 <script>
 const GLASS_SERVICE_FFF0 = '0000fff0-0000-1000-8000-00805f9b34fb';
-const PROPS = [
+const KNOWN = [
   'd44bc439-abfd-45a2-b575-925416129600',
   'd44bc439-abfd-45a2-b575-925416129601',
   'd44bc439-abfd-45a2-b575-92541612960a',
@@ -31,15 +28,19 @@ const PROPS = [
 ];
 
 let server = null;
-let foundChars = []; // {serviceUuid, char}
+let candidates = []; // {char, serviceUuid}
 
 function log(s){
   const el = document.getElementById('log');
   el.textContent = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.textContent;
   console.log(s);
 }
+function clearLog(){ document.getElementById('log').textContent = ''; candidates = []; document.getElementById('btnRun').disabled = true; }
 
-async function connectGlasses(){
+document.getElementById('btnConnect').addEventListener('click', connect);
+document.getElementById('btnRun').addEventListener('click', runTests);
+
+async function connect(){
   try {
     log('requestDevice (acceptAllDevices, optional FFF0)...');
     const device = await navigator.bluetooth.requestDevice({
@@ -47,7 +48,7 @@ async function connectGlasses(){
       optionalServices: [GLASS_SERVICE_FFF0]
     });
     log('Ausgewählt: ' + (device.name || device.id));
-    device.addEventListener('gattserverdisconnected', () => { log('Brille: disconnected'); foundChars = []; server = null; });
+    device.addEventListener('gattserverdisconnected', ()=> { log('Brille: disconnected'); candidates = []; server = null; document.getElementById('btnRun').disabled = true; });
     server = await device.gatt.connect();
     log('GATT connected. Enumerating services...');
     const services = await server.getPrimaryServices();
@@ -57,75 +58,100 @@ async function connectGlasses(){
         const chars = await s.getCharacteristics();
         for (const c of chars){
           log(' - Char: ' + c.uuid + ' props: ' + JSON.stringify(c.properties));
-          // Collect write-capable and proprietary chars
-          if (c.properties.write || c.properties.writeWithoutResponse || PROPS.includes(c.uuid)){
-            foundChars.push({service: s.uuid, char: c});
+          // collect write-capable OR known proprietary UUIDs
+          if (c.properties.write || c.properties.writeWithoutResponse || KNOWN.includes(c.uuid)) {
+            candidates.push({char: c, service: s.uuid});
           }
         }
       } catch(e){
         log('  -> Fehler beim Lesen der Characteristics: ' + (e && e.message));
       }
     }
-    if (foundChars.length) log('Found ' + foundChars.length + ' candidate characteristics.');
-    else log('Keine candidate characteristics gefunden.');
+    if (candidates.length) {
+      log('Found ' + candidates.length + ' candidate characteristics (will test them).');
+      document.getElementById('btnRun').disabled = false;
+    } else {
+      log('Keine candidate characteristics gefunden.');
+    }
   } catch(e){
     log('Connect Fehler: ' + (e && (e.name + ' / ' + e.message)));
   }
 }
 
-/* Try multiple payload formats on every found char */
-async function sendAllTests(){
-  if (!foundChars.length){ log('Keine chars gefunden - bitte zuerst Connect'); return; }
-  // common payloads to try
-  const tests = [
-    new Uint8Array([0x01]),
-    new Uint8Array([0x02]),
-    new TextEncoder().encode('A'),
-    new TextEncoder().encode('B'),
-    new Uint8Array([0xAA, 0x55, 0x01]),
-    new Uint8Array([0x7E, 0x04, 0x01, 0x00]),
-    new Uint8Array([0x00, 0x01, 0x02, 0x03])
-  ];
-  for (const t of tests){
-    for (const entry of foundChars){
-      try {
-        await entry.char.writeValue(t);
-        log('Wrote ' + hexDump(t) + ' -> ' + entry.char.uuid);
-        await sleep(120); // short pause between writes
-      } catch(e){
-        log('Write Fehler ' + entry.char.uuid + ' : ' + (e && e.message));
-      }
-    }
-    await sleep(250);
-  }
-  log('Alle Tests gesendet.');
-}
+function checksumSum(bytes){ let s=0; for(const b of bytes) s=(s+b)&0xFF; return s; }
+function checksumInv(bytes){ return (~checksumSum(bytes)) & 0xFF; }
 
-/* send same single-byte to known proprietary chars in sequence */
-async function sendOneByOne(){
-  if (!server) { log('Nicht verbunden'); return; }
-  try {
-    const svc = await server.getPrimaryService(GLASS_SERVICE_FFF0);
-    for (const uuid of PROPS){
-      try {
-        const c = await svc.getCharacteristic(uuid);
-        await c.writeValue(new Uint8Array([0x01]));
-        log('Sent 0x01 -> ' + uuid);
-        await sleep(150);
-      } catch(e){
-        log('Nicht erreichbar: ' + uuid + ' (' + (e && e.message) + ')');
-      }
+async function runTests(){
+  if (!candidates.length){ log('Keine Kandidaten. Bitte zuerst Connect.'); return; }
+  document.getElementById('btnRun').disabled = true;
+  log('Starte bruteforce auf ' + candidates.length + ' chars...');
+  // define payload templates (some with auto-checksum)
+  const templates = [
+    {data: [0x01]},
+    {data: [0x02]},
+    {data: Array.from(new TextEncoder().encode('A'))},
+    {data: Array.from(new TextEncoder().encode('B'))},
+    {data: [0x00,0x01]},
+    {data: [0x01,0x00]},
+    {data: [0xAA,0x55,0x01]},
+    {data: [0xAA,0x55,0x02]},
+    {data: [0x7E,0x03,0x01]},      // 7E len cmd
+    {data: [0x7E,0x04,0x02,0x00]},// 7E len cmd data
+    {data: [0x55,0xAA,0x01]},
+    {data: [0xCC,0x33,0x01]},
+    {data: [0x01,0x02,0x03,0x04]},
+    // templates with checksum variants - will be expanded
+    {data: [0xAA,0x55,0x01], checksum: 'sum'},
+    {data: [0xAA,0x55,0x02], checksum: 'inv'},
+    {data: [0x7E,0x02,0x01], checksum: 'sum'},
+    {data: [0x7E,0x03,0x02], checksum: 'inv'}
+  ];
+  // expand templates to actual payloads
+  const payloads = [];
+  for (const t of templates){
+    if (!t.checksum) {
+      payloads.push(new Uint8Array(t.data));
+    } else if (t.checksum === 'sum') {
+      const s = checksumSum(t.data);
+      payloads.push(new Uint8Array([...t.data, s]));
+    } else if (t.checksum === 'inv') {
+      const s = checksumInv(t.data);
+      payloads.push(new Uint8Array([...t.data, s]));
     }
-  } catch(e){
-    log('FFF0 Service nicht zugreifbar: ' + (e && e.message));
   }
+  // also add a small scan of single-byte 0x00..0x0f
+  for (let b=0;b<16;b++){
+    payloads.push(new Uint8Array([b]));
+  }
+  // run through candidates
+  for (const entry of candidates){
+    const c = entry.char;
+    log('--- Testing char ' + c.uuid + ' (service ' + entry.service + ') ---');
+    for (const p of payloads){
+      try {
+        await c.writeValue(p);
+        log('Wrote ' + hexDump(p) + ' -> ' + c.uuid);
+      } catch(e){
+        log('Write Fehler ' + c.uuid + ' : ' + (e && e.message));
+      }
+      // short pause, and let the user see possible LED reaction
+      await sleep(180);
+    }
+    // additional repeating small sequences which some firmwares expect
+    try {
+      await c.writeValue(new Uint8Array([0xAA,0x55,0x01,0x01, checksumSum([0xAA,0x55,0x01,0x01])]));
+      log('Wrote extra pattern to ' + c.uuid);
+    } catch(e){ /* ignore */ }
+    await sleep(300);
+  }
+  log('Bruteforce finished. Schau die Brille nach Reaktionen.');
+  document.getElementById('btnRun').disabled = false;
 }
 
 function hexDump(u8){
   return Array.from(u8).map(x => x.toString(16).padStart(2,'0')).join(' ');
 }
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-function clearLog(){ document.getElementById('log').textContent = ''; foundChars = []; }
 
 </script>
 </body>
