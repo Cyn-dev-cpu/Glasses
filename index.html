@@ -3,153 +3,135 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Glasses — Shutdown / Recovery Attempts</title>
+<title>Glasses — Targeted Power-Fix</title>
 <style>
-  body{font-family:system-ui,Arial,sans-serif;background:#111;color:#eee;padding:16px}
-  button{display:block;width:100%;padding:12px;margin:8px 0;border-radius:8px;border:none;font-size:15px;cursor:pointer}
-  .log{background:#000;padding:10px;height:420px;overflow:auto;font-family:monospace;font-size:12px;white-space:pre-wrap}
+  body{font-family:system-ui,Arial,sans-serif;background:#121212;color:#eee;padding:16px}
+  button{display:block;width:100%;padding:12px;margin:8px 0;border-radius:8px;border:none;font-size:16px}
+  .log{background:#000;padding:10px;height:360px;overflow:auto;font-family:monospace;font-size:12px;white-space:pre-wrap}
 </style>
 </head>
 <body>
-  <h2>Glasses — Shutdown / Recovery Attempts</h2>
-  <p>Close Shining app, ensure power. Connect, then try "Start Shutdown Attempts". Watch log and glasses.</p>
-  <button id="btnConnect">Connect Glasses</button>
-  <button id="btnStart" disabled>Start Shutdown Attempts</button>
-  <button id="btnStop" disabled>Stop</button>
-  <button onclick="clearLog()">Clear Log</button>
-  <div class="log" id="log">Log starts...</div>
+  <h2>Glasses — Targeted Power-Fix</h2>
+  <p>Connect → Button "Try Power Commands" sendet gezielt an die "Client To Server" Charakteristik (FFF0).</p>
+  <button id="btnConnect">Connect to Glasses</button>
+  <button id="btnPower" disabled>Try Power Commands</button>
+  <div class="log" id="log">Log startet...</div>
 
 <script>
-const GUESS_SERVICE = '0000fff0-0000-1000-8000-00805f9b34fb';
-const KNOWN_CHARS = [
+const SERVICE_FFF0 = '0000fff0-0000-1000-8000-00805f9b34fb';
+// mögliche proprietary UUIDs (aus deinem Log)
+const PROPRIETARY = [
   'd44bc439-abfd-45a2-b575-925416129600',
   'd44bc439-abfd-45a2-b575-925416129601',
   'd44bc439-abfd-45a2-b575-92541612960a',
   'd44bc439-abfd-45a2-b575-92541612960b'
 ];
 
+let targetChar = null;
 let server = null;
-let candidates = []; // {char, service}
-let running = false;
+function log(s){ document.getElementById('log').textContent = `[${new Date().toLocaleTimeString()}] ${s}\n` + document.getElementById('log').textContent; console.log(s); }
 
-function log(s){ const el=document.getElementById('log'); el.textContent = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.textContent; console.log(s); }
-function clearLog(){ document.getElementById('log').textContent = ''; }
-
-document.getElementById('btnConnect').addEventListener('click', connectDevice);
-document.getElementById('btnStart').addEventListener('click', ()=>{ running=true; document.getElementById('btnStop').disabled=false; document.getElementById('btnStart').disabled=true; runShutdown(); });
-document.getElementById('btnStop').addEventListener('click', ()=>{ running=false; document.getElementById('btnStop').disabled=true; document.getElementById('btnStart').disabled=false; });
-
-async function connectDevice(){
-  try {
-    log('Requesting device (acceptAllDevices, optional FFF0) ...');
-    const device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [GUESS_SERVICE] });
-    log('Selected: ' + (device.name || device.id));
-    device.addEventListener('gattserverdisconnected', ()=>{ log('Glasses: disconnected'); candidates=[]; server=null; document.getElementById('btnStart').disabled=true; });
+document.getElementById('btnConnect').addEventListener('click', async ()=>{
+  try{
+    log('Request device (acceptAllDevices, optional FFF0)...');
+    const device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [SERVICE_FFF0]});
+    log('Selected: ' + (device.name||device.id));
+    device.addEventListener('gattserverdisconnected', ()=> { log('Device disconnected'); targetChar=null; server=null; document.getElementById('btnPower').disabled=true; });
     server = await device.gatt.connect();
-    log('GATT connected. Enumerating services...');
-    const services = await server.getPrimaryServices();
-    for (const s of services){
-      log('Service: ' + s.uuid);
+    log('Connected GATT, enumerating FFF0 service...');
+    const svc = await server.getPrimaryService(SERVICE_FFF0);
+    const chars = await svc.getCharacteristics();
+    log('Found ' + chars.length + ' chars in FFF0.');
+    // Strategy: prefer characteristic whose user description contains "Client To Server"
+    for (const c of chars){
       try {
-        const chars = await s.getCharacteristics();
-        for (const c of chars){
-          log(' - Char: ' + c.uuid + ' props: ' + JSON.stringify(c.properties));
-          if (c.properties.write || c.properties.writeWithoutResponse || KNOWN_CHARS.includes(c.uuid)) {
-            candidates.push({char: c, service: s.uuid});
-          }
-        }
-      } catch(e){
-        log('  -> Characteristic read error: ' + (e && e.message));
-      }
+        // try to read descriptor or user description if available
+        // Some clients don't provide descriptor text via Web Bluetooth; we still check UUID lists
+        log('Char: ' + c.uuid + ' props: ' + JSON.stringify(c.properties));
+      } catch(e){}
     }
-    if (candidates.length) {
-      log('Candidates found: ' + candidates.map(x=>x.char.uuid).join(', '));
-      document.getElementById('btnStart').disabled = false;
+    // Find by known proprietary UUID first (prefer the one labeled in your screenshot as "Client To Server")
+    for (const want of PROPRIETARY){
+      const found = chars.find(ch => ch.uuid.toLowerCase() === want.toLowerCase());
+      if (found) { targetChar = found; log('Using proprietary char: ' + found.uuid); break; }
+    }
+    // If none found, pick first write-capable char
+    if (!targetChar) {
+      targetChar = chars.find(ch => ch.properties.write || ch.properties.writeWithoutResponse);
+      if (targetChar) log('Using first write-capable char: ' + targetChar.uuid);
+    }
+    if (targetChar) {
+      document.getElementById('btnPower').disabled = false;
+      log('Ready. Target char: ' + targetChar.uuid);
     } else {
-      log('No candidate characteristics found (nothing writable or known).');
+      log('Keine write-fähige Characteristic gefunden in FFF0.');
     }
   } catch(e){
     log('Connect error: ' + (e && (e.name + ' / ' + e.message)));
   }
-}
+});
 
-// helper checksum and hex
-function sum(bytes){ let s=0; for(const b of bytes) s=(s+b)&0xFF; return s; }
-function inv(bytes){ return (~sum(bytes)) & 0xFF; }
-function hexDump(u8){ return Array.from(u8).map(x=>x.toString(16).padStart(2,'0')).join(' '); }
-function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-// candidate shutdown / reset payloads (common patterns)
-function buildPayloads(){
-  const p = [];
-  // simple single-byte tries
-  p.push(new Uint8Array([0x00]));
-  p.push(new Uint8Array([0xFF]));
-  p.push(new Uint8Array([0xFE]));
-  p.push(new Uint8Array([0x01]));
-  p.push(new Uint8Array([0x02]));
-  p.push(new Uint8Array([0x03]));
-  // ASCII tries
-  p.push(new TextEncoder().encode('A'));
-  p.push(new TextEncoder().encode('B'));
-  p.push(new TextEncoder().encode('S')); // maybe stop
-  p.push(new TextEncoder().encode('O')); // maybe off
-  // AA55 style header
-  p.push(new Uint8Array([0xAA,0x55,0x00]));
-  p.push(new Uint8Array([0xAA,0x55,0x01]));
-  p.push(new Uint8Array([0xAA,0x55,0x02]));
-  // AA55 + length + cmd + checksum
-  p.push(new Uint8Array([0xAA,0x55,0x01,0x01, sum([0xAA,0x55,0x01,0x01])]));
-  p.push(new Uint8Array([0xAA,0x55,0x02,0x00, sum([0xAA,0x55,0x02,0x00])]));
-  // 7E framed packets
-  p.push(new Uint8Array([0x7E,0x02,0x00, sum([0x7E,0x02,0x00])]));
-  p.push(new Uint8Array([0x7E,0x03,0x01, sum([0x7E,0x03,0x01])]));
-  // small multi-byte sequences
-  p.push(new Uint8Array([0x01,0x00]));
-  p.push(new Uint8Array([0x01,0x01,0x01]));
-  p.push(new Uint8Array([0x55,0xAA,0x01]));
-  // common "magic" patterns
-  p.push(new Uint8Array([0xCC,0x33,0x01]));
-  // more single-bytes scan
-  for(let b=0;b<16;b++) p.push(new Uint8Array([b]));
-  return p;
-}
-
-async function runShutdown(){
-  if (!candidates.length){ log('No candidates — connect first'); running=false; return; }
-  const payloads = buildPayloads();
-  log('Starting shutdown attempts: ' + payloads.length + ' payloads x ' + candidates.length + ' chars');
-  // iterate rounds to give time for reaction:
-  for (const cEntry of candidates){
-    if (!running) break;
-    const c = cEntry.char;
-    log('>>> Testing char ' + c.uuid + ' (service ' + cEntry.service + ')');
-    for (const p of payloads){
-      if (!running) break;
-      try {
-        await c.writeValue(p);
-        log('Wrote ' + hexDump(p) + ' -> ' + c.uuid);
-      } catch(e){
-        log('Write Error ' + c.uuid + ' : ' + (e && (e.message || e.name)));
+document.getElementById('btnPower').addEventListener('click', async ()=>{
+  if (!targetChar) { log('Kein Ziel-Char gesetzt'); return; }
+  log('Sending targeted power sequences to ' + targetChar.uuid);
+  const payloads = [
+    hex('54 52 00 41'),       // manufacturer advert pattern
+    new Uint8Array([0x01]),
+    new Uint8Array([0x02]),
+    hex('AA 55 01'),
+    hexWithChecksum('AA 55 01 01'), // AA55 len cmd data + sum checksum
+    hexWithChecksum('7E 03 01')     // example framed packet
+  ];
+  for (const p of payloads){
+    try {
+      // prefer writeValue (will choose with/without response depending on server)
+      if (typeof targetChar.writeValue === 'function') {
+        await targetChar.writeValue(p);
+        log('Wrote ' + toHex(p));
+      } else if (typeof targetChar.writeValueWithoutResponse === 'function') {
+        await targetChar.writeValueWithoutResponse(p);
+        log('Wrote (noresp) ' + toHex(p));
+      } else {
+        log('No write API available on this platform for char ' + targetChar.uuid);
       }
-      await sleep(180); // small pause to observe
+    } catch(err){
+      // If writeValue fails, try writeValueWithoutResponse if available
+      log('Write failed: ' + (err && err.message));
+      try {
+        if (typeof targetChar.writeValueWithoutResponse === 'function') {
+          await targetChar.writeValueWithoutResponse(p);
+          log('Fallback wrote (noresp) ' + toHex(p));
+        }
+      } catch(e2){
+        log('Fallback also failed: ' + (e2 && e2.message));
+      }
     }
-    // quick repeated toggles
-    for (let i=0;i<6 && running;i++){
-      try{ await c.writeValue(new Uint8Array([0x01])); }catch(e){}
-      await sleep(80);
-      try{ await c.writeValue(new Uint8Array([0x02])); }catch(e){}
-      await sleep(80);
-    }
-    // small pause
-    await sleep(400);
+    await delay(220);
   }
-  log('Shutdown attempts finished (or stopped). Check glasses for any response.');
-  running = false;
-  document.getElementById('btnStop').disabled = true;
-  document.getElementById('btnStart').disabled = false;
-}
+  // try small toggles (01 / 02) repeated
+  for (let i=0;i<6;i++){
+    try { await targetChar.writeValue(new Uint8Array([0x01])); } catch(e){}
+    await delay(90);
+    try { await targetChar.writeValue(new Uint8Array([0x02])); } catch(e){}
+    await delay(90);
+  }
+  log('Power sequence finished — beobachte die Brille.');
+});
 
+// helpers
+function hex(s){
+  const clean = s.replace(/[^0-9a-fA-F]/g,'');
+  const out = new Uint8Array(clean.length/2);
+  for(let i=0;i<clean.length;i+=2) out[i/2]=parseInt(clean.substr(i,2),16);
+  return out;
+}
+function toHex(u8){ return Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(' '); }
+function hexWithChecksum(s){
+  const arr = Array.from(hex(s));
+  let sum=0; for(const b of arr) sum=(sum+b)&0xFF;
+  return new Uint8Array([...arr, sum]);
+}
+function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
 </script>
 </body>
 </html>
