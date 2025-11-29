@@ -3,135 +3,221 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Glasses — Targeted Power-Fix</title>
+<title>Eye Bridge — Micro:bit → Brille</title>
 <style>
-  body{font-family:system-ui,Arial,sans-serif;background:#121212;color:#eee;padding:16px}
-  button{display:block;width:100%;padding:12px;margin:8px 0;border-radius:8px;border:none;font-size:16px}
-  .log{background:#000;padding:10px;height:360px;overflow:auto;font-family:monospace;font-size:12px;white-space:pre-wrap}
+  body{font-family:system-ui,Arial;background:#121212;color:#eee;padding:12px}
+  h1{font-size:16px}
+  button{display:block;width:100%;padding:12px;margin:8px 0;border-radius:8px;border:none;font-size:16px;cursor:pointer}
+  .btnMicro{background:#d33682;color:#fff}
+  .btnGlass{background:#268bd2;color:#fff}
+  .log{background:#000;padding:10px;height:300px;overflow:auto;font-family:monospace;font-size:12px;white-space:pre-wrap}
+  .controls{display:flex;gap:8px}
+  input[type="color"]{height:44px}
 </style>
 </head>
 <body>
-  <h2>Glasses — Targeted Power-Fix</h2>
-  <p>Connect → Button "Try Power Commands" sendet gezielt an die "Client To Server" Charakteristik (FFF0).</p>
-  <button id="btnConnect">Connect to Glasses</button>
-  <button id="btnPower" disabled>Try Power Commands</button>
+  <h1>Eye Bridge — Micro:bit → Brille</h1>
+  <p class="small">Flash micro:bit mit dem MakeCode-Skript. Öffne diese Seite (Chrome/Bluefy). Schließe Shining-App.</p>
+
+  <button class="btnMicro" onclick="connectMicrobit()">1) Micro:bit verbinden</button>
+  <div id="statusMicro">Status: nicht verbunden</div>
+
+  <button class="btnGlass" onclick="connectGlasses()">2) Brille verbinden</button>
+  <div id="statusGlass">Status: nicht verbunden</div>
+
+  <div class="controls">
+    <input id="colorPicker" type="color" value="#ffcc33"/>
+    <input id="brightness" type="range" min="0" max="100" value="80"/>
+    <button onclick="makeImage()">Make it like image</button>
+  </div>
+
+  <div style="margin-top:8px">
+    <button onclick="sendTest('L')">Left</button>
+    <button onclick="sendTest('R')">Right</button>
+    <button onclick="sendTest('B')">Both</button>
+    <button onclick="sendTest('O')">Off</button>
+    <button onclick="startBreath()">Start Breath</button>
+    <button onclick="stopBreath()">Stop Breath</button>
+  </div>
+
   <div class="log" id="log">Log startet...</div>
 
 <script>
-const SERVICE_FFF0 = '0000fff0-0000-1000-8000-00805f9b34fb';
-// mögliche proprietary UUIDs (aus deinem Log)
-const PROPRIETARY = [
+/* Config */
+const MBIT_UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const MBIT_UART_RX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+const GLASS_SERVICE_FFF0 = '0000fff0-0000-1000-8000-00805f9b34fb';
+const KNOWN_GLASS_CHARS = [
   'd44bc439-abfd-45a2-b575-925416129600',
   'd44bc439-abfd-45a2-b575-925416129601',
   'd44bc439-abfd-45a2-b575-92541612960a',
   'd44bc439-abfd-45a2-b575-92541612960b'
 ];
 
-let targetChar = null;
-let server = null;
-function log(s){ document.getElementById('log').textContent = `[${new Date().toLocaleTimeString()}] ${s}\n` + document.getElementById('log').textContent; console.log(s); }
+let microNotify = null;
+let glassChar = null;
+let breathInterval = null;
 
-document.getElementById('btnConnect').addEventListener('click', async ()=>{
-  try{
-    log('Request device (acceptAllDevices, optional FFF0)...');
-    const device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [SERVICE_FFF0]});
-    log('Selected: ' + (device.name||device.id));
-    device.addEventListener('gattserverdisconnected', ()=> { log('Device disconnected'); targetChar=null; server=null; document.getElementById('btnPower').disabled=true; });
-    server = await device.gatt.connect();
-    log('Connected GATT, enumerating FFF0 service...');
-    const svc = await server.getPrimaryService(SERVICE_FFF0);
-    const chars = await svc.getCharacteristics();
-    log('Found ' + chars.length + ' chars in FFF0.');
-    // Strategy: prefer characteristic whose user description contains "Client To Server"
-    for (const c of chars){
+function log(s){ const el=document.getElementById('log'); el.textContent = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.textContent; console.log(s); }
+
+/* Micro:bit connect */
+async function connectMicrobit(){
+  try {
+    log('Request Micro:bit...');
+    const device = await navigator.bluetooth.requestDevice({ acceptAllDevices:true, optionalServices:[MBIT_UART_SERVICE] });
+    device.addEventListener('gattserverdisconnected', ()=>{ log('Micro:bit disconnected'); document.getElementById('statusMicro').innerText='nicht verbunden'; microNotify=null; });
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(MBIT_UART_SERVICE);
+    const rx = await svc.getCharacteristic(MBIT_UART_RX);
+    await rx.startNotifications();
+    rx.addEventListener('characteristicvaluechanged', onMicrobitNotify);
+    microNotify = rx;
+    document.getElementById('statusMicro').innerText = '✅ Verbunden (UART)';
+    log('Micro:bit UART notifications active.');
+  } catch(e){ log('Micro connect error: ' + (e && (e.message||e.name))); document.getElementById('statusMicro').innerText='Fehler'; }
+}
+
+function onMicrobitNotify(evt){
+  const txt = new TextDecoder().decode(evt.target.value || evt.value);
+  log('micro:bit -> ' + txt.trim());
+  handleMbitCmd(txt.trim());
+}
+
+/* Glass connect */
+async function connectGlasses(){
+  try {
+    log('Request Glasses...');
+    const device = await navigator.bluetooth.requestDevice({ acceptAllDevices:true, optionalServices:[GLASS_SERVICE_FFF0] });
+    device.addEventListener('gattserverdisconnected', ()=>{ log('Brille disconnected'); glassChar=null; document.getElementById('statusGlass').innerText='nicht verbunden'; });
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(GLASS_SERVICE_FFF0);
+    // try known proprietary
+    for (const u of KNOWN_GLASS_CHARS){
       try {
-        // try to read descriptor or user description if available
-        // Some clients don't provide descriptor text via Web Bluetooth; we still check UUID lists
-        log('Char: ' + c.uuid + ' props: ' + JSON.stringify(c.properties));
+        const c = await svc.getCharacteristic(u);
+        log('Found known char: ' + c.uuid);
+        glassChar = c;
+        break;
       } catch(e){}
     }
-    // Find by known proprietary UUID first (prefer the one labeled in your screenshot as "Client To Server")
-    for (const want of PROPRIETARY){
-      const found = chars.find(ch => ch.uuid.toLowerCase() === want.toLowerCase());
-      if (found) { targetChar = found; log('Using proprietary char: ' + found.uuid); break; }
-    }
-    // If none found, pick first write-capable char
-    if (!targetChar) {
-      targetChar = chars.find(ch => ch.properties.write || ch.properties.writeWithoutResponse);
-      if (targetChar) log('Using first write-capable char: ' + targetChar.uuid);
-    }
-    if (targetChar) {
-      document.getElementById('btnPower').disabled = false;
-      log('Ready. Target char: ' + targetChar.uuid);
-    } else {
-      log('Keine write-fähige Characteristic gefunden in FFF0.');
-    }
-  } catch(e){
-    log('Connect error: ' + (e && (e.name + ' / ' + e.message)));
-  }
-});
-
-document.getElementById('btnPower').addEventListener('click', async ()=>{
-  if (!targetChar) { log('Kein Ziel-Char gesetzt'); return; }
-  log('Sending targeted power sequences to ' + targetChar.uuid);
-  const payloads = [
-    hex('54 52 00 41'),       // manufacturer advert pattern
-    new Uint8Array([0x01]),
-    new Uint8Array([0x02]),
-    hex('AA 55 01'),
-    hexWithChecksum('AA 55 01 01'), // AA55 len cmd data + sum checksum
-    hexWithChecksum('7E 03 01')     // example framed packet
-  ];
-  for (const p of payloads){
-    try {
-      // prefer writeValue (will choose with/without response depending on server)
-      if (typeof targetChar.writeValue === 'function') {
-        await targetChar.writeValue(p);
-        log('Wrote ' + toHex(p));
-      } else if (typeof targetChar.writeValueWithoutResponse === 'function') {
-        await targetChar.writeValueWithoutResponse(p);
-        log('Wrote (noresp) ' + toHex(p));
-      } else {
-        log('No write API available on this platform for char ' + targetChar.uuid);
-      }
-    } catch(err){
-      // If writeValue fails, try writeValueWithoutResponse if available
-      log('Write failed: ' + (err && err.message));
-      try {
-        if (typeof targetChar.writeValueWithoutResponse === 'function') {
-          await targetChar.writeValueWithoutResponse(p);
-          log('Fallback wrote (noresp) ' + toHex(p));
-        }
-      } catch(e2){
-        log('Fallback also failed: ' + (e2 && e2.message));
+    if (!glassChar) {
+      const chars = await svc.getCharacteristics();
+      for (const c of chars){
+        if (c.properties.write || c.properties.writeWithoutResponse){ glassChar = c; log('Fallback char: ' + c.uuid); break; }
       }
     }
-    await delay(220);
-  }
-  // try small toggles (01 / 02) repeated
-  for (let i=0;i<6;i++){
-    try { await targetChar.writeValue(new Uint8Array([0x01])); } catch(e){}
-    await delay(90);
-    try { await targetChar.writeValue(new Uint8Array([0x02])); } catch(e){}
-    await delay(90);
-  }
-  log('Power sequence finished — beobachte die Brille.');
-});
+    if (glassChar){ document.getElementById('statusGlass').innerText='✅ Verbunden (char: ' + glassChar.uuid + ')'; log('Write char set: ' + glassChar.uuid); } else { document.getElementById('statusGlass').innerText='Keine write-char gefunden'; log('No write char'); }
+  } catch(e){ log('Glasses connect error: ' + (e && (e.message||e.name))); }
+}
 
-// helpers
-function hex(s){
-  const clean = s.replace(/[^0-9a-fA-F]/g,'');
-  const out = new Uint8Array(clean.length/2);
-  for(let i=0;i<clean.length;i+=2) out[i/2]=parseInt(clean.substr(i,2),16);
-  return out;
+/* Handle microbit commands (string format) */
+function handleMbitCmd(cmd){
+  // examples:
+  // "L#ffcc33#80"  -> left color #ffcc33 brightness 80%
+  // "B#ffcc33#75:breath" -> both, breath
+  if (!cmd) return;
+  // normalize
+  cmd = cmd.replace(/\s+/g,'');
+  // check for breath suffix
+  const isBreath = cmd.includes(':breath');
+  const base = cmd.split(':')[0];
+  const parts = base.split('#');
+  const side = parts[0] || 'B';
+  const color = (parts[1] || 'ffcc33').replace('#','');
+  const bright = parseInt(parts[2] || '80');
+  log('Parsed: side=' + side + ' color=' + color + ' bright=' + bright + ' breath=' + isBreath);
+  // send to glasses (attempt multiple formats)
+  sendColorCommand(side, color, bright, isBreath);
 }
-function toHex(u8){ return Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(' '); }
-function hexWithChecksum(s){
-  const arr = Array.from(hex(s));
-  let sum=0; for(const b of arr) sum=(sum+b)&0xFF;
-  return new Uint8Array([...arr, sum]);
+
+/* Send color/brightness to glasses (tries multiple common frame formats) */
+async function sendColorCommand(side, hexColor, brightness, breath){
+  if (!glassChar){ log('No glass char'); return; }
+  // convert hex to RGB bytes 0-255
+  const r = parseInt(hexColor.substring(0,2),16);
+  const g = parseInt(hexColor.substring(2,4),16);
+  const b = parseInt(hexColor.substring(4,6),16);
+  // 1) Try a simple single-byte mapping (fallback)
+  const sideMap = { 'L': 0x01, 'R': 0x02, 'B': 0x03, 'O': 0x00 };
+  try {
+    // if simple commands are known to work, send them first as quick action
+    if (side in sideMap){
+      await glassChar.writeValue(new Uint8Array([sideMap[side]]));
+      log('Sent simple cmd ' + sideMap[side].toString(16));
+    }
+  } catch(e){ log('simple write failed: ' + e.message); }
+
+  // 2) Try RGB frame: AA 55 LEN CMD SIDE R G B BR CHECKSUM (common pattern)
+  const cmd = 0x10; // example command id for set color (guess)
+  const payload = [0xAA,0x55,0x06,cmd, (side === 'L'?0x01: side === 'R'?0x02:0x03), r, g, b, Math.round((brightness/100)*255)];
+  const sum = payload.reduce((s,x)=> (s + x)&0xFF,0);
+  const frame = new Uint8Array([...payload, sum]);
+  try {
+    await glassChar.writeValue(frame);
+    log('Sent RGB frame: ' + toHex(frame));
+  } catch(e){ log('RGB frame failed: ' + (e && e.message)); }
+
+  // 3) Try alternate frame: 7E LEN CMD SIDE R G B BR CHKSUM
+  const payload2 = [0x7E,0x07,0x20, (side==='L'?0x01: side==='R'?0x02:0x03), r,g,b, Math.round((brightness/100)*255)];
+  const sum2 = payload2.reduce((s,x)=> (s+x)&0xFF,0);
+  const frame2 = new Uint8Array([...payload2, sum2]);
+  try{
+    await glassChar.writeValue(frame2);
+    log('Sent alt frame: ' + toHex(frame2));
+  } catch(e){ log('Alt frame failed: ' + (e && e.message)); }
+
+  // 4) If breath requested, run a soft breathing effect locally by varying brightness
+  if (breath){
+    startLocalBreath(side, r,g,b, brightness);
+  }
 }
-function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+/* local breathing: do not spam device — gentle steps */
+function startLocalBreath(side, r,g,b, startBright){
+  stopBreath();
+  let step = 0;
+  breathInterval = setInterval(async ()=>{
+    // smooth sine-based brightness 0..1
+    const t = (Math.sin(step/10) + 1)/2; // 0..1
+    const br = Math.round(((t * startBright)/100) * 255);
+    // build small set color packet: try a compact frame if available
+    if (!glassChar) return;
+    const sideByte = (side==='L'?0x01: side==='R'?0x02:0x03);
+    const small = new Uint8Array([0xAA,0x55,0x05,0x11, sideByte, r, g, b, br, ( (0xAA+0x55+0x05+0x11+sideByte+r+g+b+br) & 0xFF )]);
+    try { await glassChar.writeValue(small); } catch(e){}
+    step++;
+  }, 180);
+  log('Started local breath loop');
+}
+
+function stopBreath(){
+  if (breathInterval){ clearInterval(breathInterval); breathInterval = null; log('Stopped breath'); }
+}
+
+/* Utility & UI actions */
+function toHex(u8){ return Array.from(u8).map(x=>x.toString(16).padStart(2,'0')).join(' '); }
+
+function sendTest(side){
+  const color = document.getElementById('colorPicker').value.replace('#','');
+  const bright = parseInt(document.getElementById('brightness').value);
+  handleMbitCmd(side + '#' + color + '#' + bright);
+}
+
+function makeImage(){
+  // warm yellow both eyes, medium-high brightness, breathing
+  handleMbitCmd('B#ffcc33#85:breath');
+}
+
+function startBreath(){ handleMbitCmd('B#ffcc33#80:breath'); }
+function stopBreathUI(){ stopBreath(); }
+
+function startBreathButton(){ startBreath(); }
+function stopBreath(){ stopBreath(); }
+
+/* convenience: allow stopping interval */
+window.addEventListener('beforeunload', ()=>{ stopBreath(); });
+
 </script>
 </body>
 </html>
